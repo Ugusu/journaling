@@ -19,6 +19,20 @@ set_date_vars() {
     mkdir -p "$DIR"
 }
 
+if [[ -n "$MODE" ]]; then
+    if [[ "$MODE" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
+        set_date_vars "$MODE"
+        MODE="edit"
+    else
+        set_date_vars "$1"
+        shift
+    fi
+else
+    MODE="edit"
+    set_date_vars
+fi
+
+
 case "$MODE" in
     attach)
         if [[ "$1" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
@@ -142,7 +156,7 @@ sync-down-all)
         exit 0
         ;;
 
-    *)
+    edit)
         set_date_vars "$1"
         shift
         # Normal edit mode
@@ -177,12 +191,20 @@ sync-down-all)
         done
         shopt -u nullglob
 
-        # Save file hash before editing
-        OLD_HASH=$(sha256sum "$FILE" | awk '{print $1}')
-        ${EDITOR:-nano} "$FILE"
-        NEW_HASH=$(sha256sum "$FILE" | awk '{print $1}')
+        # Save file hash before editin
+        GPG_TMP=$(mktemp)
+        if [ -f "$ENC_FILE" ]; then
+            gpg --batch --yes -o "$GPG_TMP" -d "$ENC_FILE" >/dev/null 2>&1
+        else
+            echo "" > "$GPG_TMP"
+        fi
 
-        if [ "$OLD_HASH" != "$NEW_HASH" ]; then
+        ORIG_HASH=$(sha256sum "$GPG_TMP" | awk '{print $1}')
+        ${EDITOR:-nano} "$FILE"
+        EDITED_HASH=$(sha256sum "$FILE" | awk '{print $1}')
+        rm -f "$GPG_TMP"
+
+        if [ "$ORIG_HASH" != "$EDITED_HASH" ]; then
             if gpg -o "$TEMP_ENC_FILE" -c "$FILE"; then
                 rm -f "$FILE"
                 rm -f "$ENC_FILE"
@@ -195,6 +217,7 @@ sync-down-all)
             fi
         else
             echo "✅ No changes made. Skipping re-encryption."
+            rm -f "$FILE"
         fi
 
         if [ -d "$IMG_DIR" ]; then
