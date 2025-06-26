@@ -10,6 +10,9 @@ POSITIONAL=()
 
 set_date_vars() {
     DATE="${1:-$(date +%F)}"
+    
+    date -d "$DATE" >/dev/null 2>&1 || { echo "❌ Invalid date: $DATE"; exit 1; }
+
     YEAR=$(date +%Y -d "$DATE")
     MONTH=$(date +%m -d "$DATE")
     DIR=~/journal/$YEAR/$MONTH
@@ -97,6 +100,10 @@ while [[ $# -gt 0 ]]; do
         edit|attach|view|search|sync-up|sync-down|sync-up-all|sync-down-all)
             MODE="$1"
             shift
+            ;;
+        --help|-h)
+            echo "Usage: $0 [edit|view|attach|sync-up|...] [--date=YYYY-MM-DD] [args...]"
+            exit 0
             ;;
         --date=*)
             DATE="${1#*=}"
@@ -205,8 +212,10 @@ case "$MODE" in
 
     search)
         TMPDIR=$(mktemp -d)
+        trap 'rm -rf "$TMPDIR"' EXIT
         echo "🔍 Searching for: $QUERY"
         shopt -s globstar nullglob
+        matches=0
         for enc_file in ~/journal/**/*.md.gpg; do
             DECRYPTED="$TMPDIR/$(basename "${enc_file%.gpg}")"
             if decrypt_file "$enc_file" "$DECRYPTED" 2>/dev/null; then
@@ -214,9 +223,11 @@ case "$MODE" in
                     echo "📅 Match in $(basename "${enc_file%.gpg}")"
                     grep -i --color=always "$QUERY" "$DECRYPTED" | sed 's/^/    /'
                     echo
+                    ((matches++))
                 fi
             fi
         done
+        echo "🔍 $matches matches found."
         shopt -u globstar nullglob
         rm -rf "$TMPDIR"
         exit 0
