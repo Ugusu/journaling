@@ -144,11 +144,25 @@ sync-down-all)
 
     *)
         set_date_vars "$1"
+        shift
         # Normal edit mode
         if [ -f "$ENC_FILE" ]; then
-            if ! gpg -o "$FILE" -d "$ENC_FILE"; then
-                echo "❌ Decryption failed."
-                exit 1
+            if [ -f "$FILE" ]; then
+                echo "⚠ Warning: plaintext $FILE already exists."
+                read -p "❓ Overwrite with decrypted version from .gpg? [y/N] " RESP
+                if [[ "$RESP" =~ ^[Yy]$ ]]; then
+                    if ! gpg --batch --yes -o "$FILE" -d "$ENC_FILE"; then
+                        echo "❌ Decryption failed."
+                        exit 1
+                    fi
+                else
+                    echo "➡️ Using existing plaintext file."
+                fi
+            else
+                if ! gpg --batch --yes -o "$FILE" -d "$ENC_FILE"; then
+                    echo "❌ Decryption failed."
+                    exit 1
+                fi
             fi
         else
             echo "# Journal - $DATE" > "$FILE"
@@ -162,22 +176,30 @@ sync-down-all)
             gpg --batch --yes -o "$OUT" -d "$enc" || echo "⚠ Failed to decrypt $enc"
         done
         shopt -u nullglob
+
+        # Save file hash before editing
+        OLD_HASH=$(sha256sum "$FILE" | awk '{print $1}')
         ${EDITOR:-nano} "$FILE"
+        NEW_HASH=$(sha256sum "$FILE" | awk '{print $1}')
 
-        if gpg -o "$TEMP_ENC_FILE" -c "$FILE"; then
-            rm -f "$FILE"
-            rm -f "$ENC_FILE"
-            mv "$TEMP_ENC_FILE" "$ENC_FILE"
+        if [ "$OLD_HASH" != "$NEW_HASH" ]; then
+            if gpg -o "$TEMP_ENC_FILE" -c "$FILE"; then
+                rm -f "$FILE"
+                rm -f "$ENC_FILE"
+                mv "$TEMP_ENC_FILE" "$ENC_FILE"
 
-            rclone copyto --no-traverse "$ENC_FILE" "$REMOTE_PATH" || \
-                echo "⚠ Upload failed — encrypted file is safe locally."
+                rclone copyto --no-traverse "$ENC_FILE" "$REMOTE_PATH" || \
+                    echo "⚠ Upload failed — encrypted file is safe locally."
+            else
+                echo "❌ Encryption failed — keeping decrypted file."
+            fi
         else
-            echo "❌ Encryption failed — keeping decrypted file."
+            echo "✅ No changes made. Skipping re-encryption."
         fi
 
         if [ -d "$IMG_DIR" ]; then
             for img in "$IMG_DIR/$DATE-"*.gpg; do
-                [ -e "$img" ] || continue  # skip if no files
+                [ -e "$img" ] || continue
                 IMG_NAME=$(basename "$img")
                 rclone copyto --no-traverse "$img" "$REMOTE_HOST/$YEAR/$MONTH/images/$IMG_NAME" || \
                     echo "⚠ Failed to upload image: $IMG_NAME"
