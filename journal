@@ -1,7 +1,12 @@
 #!/bin/bash
 
-MODE="$1"
-shift
+# --- Defaults
+MODE=""
+DATE=""
+QUERY=""
+POSITIONAL=()
+
+# --- Helpers
 
 set_date_vars() {
     DATE="${1:-$(date +%F)}"
@@ -19,19 +24,103 @@ set_date_vars() {
     mkdir -p "$DIR"
 }
 
-if [[ -n "$MODE" ]]; then
-    if [[ "$MODE" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
-        set_date_vars "$MODE"
-        MODE="edit"
-    else
-        set_date_vars "$1"
-        shift
-    fi
-else
-    MODE="edit"
-    set_date_vars
-fi
+decrypt_file() {
+    local input="$1"
+    local output="$2"
+    gpg --batch --yes -o "$output" -d "$input"
+}
 
+decrypt_images_for_date() {
+    local out_dir="$1"
+    mkdir -p "$out_dir"
+    shopt -s nullglob
+    for enc in "$IMG_DIR/$DATE-"*.gpg; do
+        BASENAME=$(basename "$enc" .gpg)
+        decrypt_file "$enc" "$out_dir/$BASENAME" || echo "⚠ Failed to decrypt $enc"
+    done
+    shopt -u nullglob
+}
+
+upload_images_for_date() {
+    [ -d "$IMG_DIR" ] || return
+    for img in "$IMG_DIR/$DATE-"*.gpg; do
+        [ -e "$img" ] || continue
+        IMG_NAME=$(basename "$img")
+        rclone copyto --no-traverse "$img" "$REMOTE_HOST/$YEAR/$MONTH/images/$IMG_NAME" || \
+            echo "⚠ Failed to upload image: $IMG_NAME"
+    done
+}
+
+download_images_for_date() {
+    REMOTE_IMG_DIR="$REMOTE_HOST/$YEAR/$MONTH/images"
+    mkdir -p "$IMG_DIR"
+    rclone copy --include "$DATE-*.gpg" --include "*/" --exclude "*" \
+        "$REMOTE_IMG_DIR/" "$IMG_DIR/" || \
+        echo "⚠ Some or all images failed to download."
+}
+
+encrypt_if_changed() {
+    local file="$1"
+    local enc_file="$2"
+    local tmp_enc="$file.new.gpg"
+    local tmp_plain
+    tmp_plain=$(mktemp)
+
+    if [ -f "$enc_file" ]; then
+        gpg --batch --yes -o "$tmp_plain" -d "$enc_file" >/dev/null 2>&1
+    else
+        echo "" > "$tmp_plain"
+    fi
+
+    local orig_hash new_hash
+    orig_hash=$(sha256sum "$tmp_plain" | awk '{print $1}')
+    new_hash=$(sha256sum "$file" | awk '{print $1}')
+    rm -f "$tmp_plain"
+
+    if [ "$orig_hash" != "$new_hash" ]; then
+        if gpg -o "$tmp_enc" -c "$file"; then
+            rm -f "$file" "$enc_file"
+            mv "$tmp_enc" "$enc_file"
+            echo "✅ File encrypted. Use 'sync-up' to upload."
+        else
+            echo "❌ Encryption failed — keeping decrypted file."
+        fi
+    else
+        echo "✅ No changes made. Skipping re-encryption."
+        rm -f "$file"
+    fi
+}
+
+# --- Argument Parsing
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        edit|attach|view|search|sync-up|sync-down|sync-up-all|sync-down-all)
+            MODE="$1"
+            shift
+            ;;
+        --date=*)
+            DATE="${1#*=}"
+            shift
+            ;;
+        --query=*)
+            QUERY="${1#*=}"
+            shift
+            ;;
+        [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9])
+            DATE="$1"
+            MODE="edit"
+            shift
+            ;;
+        *)
+            POSITIONAL+=("$1")
+            shift
+            ;;
+    esac
+done
+set -- "${POSITIONAL[@]}"  # restore positional args
+
+MODE="${MODE:-edit}"
+set_date_vars "$DATE"
 
 case "$MODE" in
     attach)
@@ -39,7 +128,7 @@ case "$MODE" in
             set_date_vars "$1"
             shift
         else
-            set_date_vars
+            set_date_vars "$DATE"
         fi
 
         if [ "$#" -eq 0 ]; then
@@ -47,16 +136,12 @@ case "$MODE" in
             exit 1
         fi
 
-        YEAR=$(date +%Y -d "$DATE")
-        MONTH=$(date +%m -d "$DATE")
-        DIR=~/journal/$YEAR/$MONTH
         mkdir -p "$IMG_DIR"
 
         for img in "$@"; do
             BASENAME="$DATE-$(basename "$img")"
             TARGET="$IMG_DIR/$BASENAME"
             echo "📎 Attaching $img → $TARGET.gpg"
-
             cp "$img" "$TARGET"
             if gpg -c "$TARGET"; then
                 rm "$TARGET"
@@ -73,59 +158,41 @@ case "$MODE" in
         done
         exit 0
         ;;
-    sync-up-all)
-    rclone copy --filter "+ *.gpg" --filter "- *" --progress ~/journal/ "${JOURNAL_REMOTE:-gdrive:journal}/" || \
-        echo "⚠ Full upload failed."
-    exit 0
-    ;;
 
-sync-down-all)
-    rclone copy --filter "+ *.gpg" --filter "- *" --progress "${JOURNAL_REMOTE:-gdrive:journal}/" ~/journal/ || \
-        echo "⚠ Full download failed."
-    exit 0
-    ;;
+    sync-up-all)
+        rclone copy --filter "+ *.gpg" --filter "- *" --progress ~/journal/ "${JOURNAL_REMOTE:-gdrive:journal}/" || \
+            echo "⚠ Full upload failed."
+        exit 0
+        ;;
+
+    sync-down-all)
+        rclone copy --filter "+ *.gpg" --filter "- *" --progress "${JOURNAL_REMOTE:-gdrive:journal}/" ~/journal/ || \
+            echo "⚠ Full download failed."
+        exit 0
+        ;;
+
     sync-up)
-        if [ -f "$ENC_FILE" ]; then
-            rclone copyto --no-traverse "$ENC_FILE" "$REMOTE_PATH" || \
-                echo "⚠ Upload failed — will retry later."
-        else
+        [ -f "$ENC_FILE" ] && rclone copyto --no-traverse "$ENC_FILE" "$REMOTE_PATH" || \
             echo "❌ No encrypted file found to upload: $ENC_FILE"
-        fi
+        upload_images_for_date
         exit 0
         ;;
 
     sync-down)
         rclone copyto --no-traverse "$REMOTE_PATH" "$ENC_FILE" || \
             echo "⚠ Download failed or file not found on remote."
+        download_images_for_date
         exit 0
         ;;
+
     view)
-        set_date_vars "$1"
         RENDERER="${JOURNAL_RENDERER:-glow}"
-
-        if [ ! -f "$ENC_FILE" ]; then
-            echo "❌ Encrypted journal not found: $ENC_FILE"
-            exit 1
-        fi
-
-        # Decrypt journa
+        [ ! -f "$ENC_FILE" ] && echo "❌ Encrypted journal not found: $ENC_FILE" && exit 1
         PREVIEW_FILE="$PREVIEW_DIR/$DATE.md"
         mkdir -p "$(dirname "$PREVIEW_FILE")"
-        if ! gpg --batch --yes -o "$PREVIEW_FILE" -d "$ENC_FILE"; then
-            echo "❌ Failed to decrypt journal."
-            exit 1
-        fi
+        decrypt_file "$ENC_FILE" "$PREVIEW_FILE" || exit 1
+        decrypt_images_for_date "$PREVIEW_DIR/images"
 
-        shopt -s nullglob
-        PREVIEW_IMG_DIR="$PREVIEW_DIR/images"
-        mkdir -p "$PREVIEW_IMG_DIR"
-        for img in "$IMG_DIR/$DATE-"*.gpg; do
-            BASENAME=$(basename "$img" .gpg)
-            gpg --batch --yes -o "$PREVIEW_IMG_DIR/$BASENAME" -d "$img" >/dev/null 2>&1
-        done
-        shopt -u nullglob
-
-        # Try to run the renderer
         if eval "$RENDERER \"$PREVIEW_FILE\""; then
             echo "✅ Rendered with: $RENDERER"
         else
@@ -135,15 +202,14 @@ sync-down-all)
         rm -rf "$PREVIEW_DIR"
         exit 0
         ;;
-    search)
-        QUERY="$3"
-        TMPDIR=$(mktemp -d)
 
+    search)
+        TMPDIR=$(mktemp -d)
         echo "🔍 Searching for: $QUERY"
         shopt -s globstar nullglob
         for enc_file in ~/journal/**/*.md.gpg; do
             DECRYPTED="$TMPDIR/$(basename "${enc_file%.gpg}")"
-            if gpg --batch --yes -o "$DECRYPTED" -d "$enc_file" 2>/dev/null; then
+            if decrypt_file "$enc_file" "$DECRYPTED" 2>/dev/null; then
                 if grep -i -q "$QUERY" "$DECRYPTED"; then
                     echo "📅 Match in $(basename "${enc_file%.gpg}")"
                     grep -i --color=always "$QUERY" "$DECRYPTED" | sed 's/^/    /'
@@ -157,78 +223,25 @@ sync-down-all)
         ;;
 
     edit)
-        set_date_vars "$1"
-        shift
-        # Normal edit mode
         if [ -f "$ENC_FILE" ]; then
             if [ -f "$FILE" ]; then
                 echo "⚠ Warning: plaintext $FILE already exists."
                 read -p "❓ Overwrite with decrypted version from .gpg? [y/N] " RESP
                 if [[ "$RESP" =~ ^[Yy]$ ]]; then
-                    if ! gpg --batch --yes -o "$FILE" -d "$ENC_FILE"; then
-                        echo "❌ Decryption failed."
-                        exit 1
-                    fi
+                    decrypt_file "$ENC_FILE" "$FILE" || exit 1
                 else
                     echo "➡️ Using existing plaintext file."
                 fi
             else
-                if ! gpg --batch --yes -o "$FILE" -d "$ENC_FILE"; then
-                    echo "❌ Decryption failed."
-                    exit 1
-                fi
+                decrypt_file "$ENC_FILE" "$FILE" || exit 1
             fi
         else
             echo "# Journal - $DATE" > "$FILE"
         fi
 
-        mkdir -p "$PREVIEW_DIR"
-        shopt -s nullglob
-        for enc in "$IMG_DIR/$DATE-"*.gpg; do
-            BASENAME=$(basename "$enc" .gpg)
-            OUT="$PREVIEW_DIR/$BASENAME"
-            gpg --batch --yes -o "$OUT" -d "$enc" || echo "⚠ Failed to decrypt $enc"
-        done
-        shopt -u nullglob
-
-        # Save file hash before editin
-        GPG_TMP=$(mktemp)
-        if [ -f "$ENC_FILE" ]; then
-            gpg --batch --yes -o "$GPG_TMP" -d "$ENC_FILE" >/dev/null 2>&1
-        else
-            echo "" > "$GPG_TMP"
-        fi
-
-        ORIG_HASH=$(sha256sum "$GPG_TMP" | awk '{print $1}')
+        decrypt_images_for_date "$PREVIEW_DIR"
         ${EDITOR:-nano} "$FILE"
-        EDITED_HASH=$(sha256sum "$FILE" | awk '{print $1}')
-        rm -f "$GPG_TMP"
-
-        if [ "$ORIG_HASH" != "$EDITED_HASH" ]; then
-            if gpg -o "$TEMP_ENC_FILE" -c "$FILE"; then
-                rm -f "$FILE"
-                rm -f "$ENC_FILE"
-                mv "$TEMP_ENC_FILE" "$ENC_FILE"
-
-                rclone copyto --no-traverse "$ENC_FILE" "$REMOTE_PATH" || \
-                    echo "⚠ Upload failed — encrypted file is safe locally."
-            else
-                echo "❌ Encryption failed — keeping decrypted file."
-            fi
-        else
-            echo "✅ No changes made. Skipping re-encryption."
-            rm -f "$FILE"
-        fi
-
-        if [ -d "$IMG_DIR" ]; then
-            for img in "$IMG_DIR/$DATE-"*.gpg; do
-                [ -e "$img" ] || continue
-                IMG_NAME=$(basename "$img")
-                rclone copyto --no-traverse "$img" "$REMOTE_HOST/$YEAR/$MONTH/images/$IMG_NAME" || \
-                    echo "⚠ Failed to upload image: $IMG_NAME"
-            done
-        fi
+        encrypt_if_changed "$FILE" "$ENC_FILE"
         rm -rf "$PREVIEW_DIR"
         ;;
 esac
-
